@@ -1,0 +1,666 @@
+---
+title: "Diseño y creación de una base de datos de juegos de la _Major League Baseball_"
+author: "Fabricio Ismael Murillo"
+date: "Junio, 2020"
+output: html_notebook
+---
+
+## Introducción
+En el presente documento haremos uso de SQL+R para diseñar una base de datos que almacene información de la [MLB](https://en.wikipedia.org/wiki/Major_League_Baseball). El Béisbol tiene una larga historia de colección de datos y analísis estadísticos por lo tanto se presta para poder realizar este trabajo. 
+
+Los datos usados en este trabajo son complilados por [Retrosheet](https://www.retrosheet.org/) la cual es una orgaización que se encarga de recolectar datos de los juegos que datan desde el siglo XIX hasta nuestros días. 
+
+Se presentan cuatro archivos que contienen esta información, el archivo principal es _game_log.csv_. Este documento es el resultado de un trabajo previo limpiando y uniendo datos provenientes de 127 archivos individuales de Retrosheet, esto fue llevado a cabo por [Dataquest Labs](https://www.dataquest.io/) 
+
+## Objetivo
+Convertir y normalizar la data dentro de tablas separadas, haciendo uso de SQL para crear una base de datos robusta de las estadísticas de los juegos.
+
+### Librerías necesarias
+```{r}
+library(dplyr)
+library(readr)
+library(RSQLite)
+library(DBI)
+```
+
+### Exploración de la data
+```{r}
+data_park <- read.csv("park_codes.csv")
+data_person <- read.csv("person_codes.csv")
+data_team <- read_csv("team_codes.csv")
+data_game_log <- read.csv("game_log.csv")
+```
+Se han cargado los 4 archivos, los tres primeros nos ayudan a hacer las cosas más fáciles, dado que ellos formaran la base para 3 de nuestras tablas normalizadas.
+
+Ahora vamos a explorar cada uno de estos archivos y dar información sobre su contenido.
+
+#### data_park
+Este contiene información de los lugares donde se han celebrado juegos, nos muestra el código único para cada recinto, su nombre, la ciudad y el estado a la cual pertence, su fecha de inauguración y su fecha de cierre en caso de haber sucedido, y por último la liga a la que pertence y algunas notas adicionales.
+
+```{r}
+head(data_park)
+```
+
+
+#### data_person
+Esta tabla en comparación con la anterior tiene menos columnas, en ella encontramos información acerca de los jugadores de la MLB, los jugadores cuentan con un id único que los identifica, sus nombres, debut como jugadores e incluso si lo llegaron a hacer como entrenadores.
+```{r}
+head(data_person)
+```
+
+#### data_team
+
+Ahora exploremos la información referente a los equipos, cada uno cuenta con un código único que lo distingue, la liga a la que pertence (Considere que la MLB es el conjunto de muchas ligas de béisbol), la ciudad a la que pertence, año de fundación, quizá su año de extinción,  y las iniciales que identifican al equipo. 
+```{r}
+head(data_team)
+```
+
+#### data_game_log
+Por último tenemos este _dataframe_, contiene más variables que los demás contando con 161 columnas que contienen información detallada de los juegos, algunos de los campos son provenientes de las tablas anteriores, por ejemplo lugares y fechas donde se desarrollan los juegos, jugadores, árbitros, etc. Se cubren muchos aspectos del juego, 
+```{r}
+head(data_game_log)
+```
+
+## Importando datos en SQLITE
+EL siguiente paso es conectarnos a la base de datos la cual llamaremos "mlb.db", el gestor de la base de datos es SQLITE y ya previamente cargamos una libreria para lenguaje R.
+```{r}
+db <- "mlb.db"
+conn <- dbConnect(SQLite(), db)
+```
+
+Esta función nos ayudará a poder ejecutar consultas, asi reducimos las lineas de código.
+```{r}
+run_query <- function(q) {
+  conn <- dbConnect(SQLite(), db)
+  result <- dbGetQuery(conn, q)
+  dbDisconnect(conn)
+  return(result)
+}
+```
+
+Ahora nuestra tareas será crear tablas que llenaremos con el contenido de los archivos csv que previamente cargamos en dataframes. Usaremos el nombre característico de cada archivo para nombrar a las tablas. El método dbWriteTable nos permite realizar esta tarea de manera sencilla. 
+```{r}
+dbWriteTable(conn, name = "data_park", value = data_park, row.names = FALSE, header = TRUE)
+dbWriteTable(conn, name = "data_person", value = data_person, row.names = FALSE, header = TRUE)
+dbWriteTable(conn, name = "data_team", value = data_team, row.names = FALSE, header = TRUE)
+dbWriteTable(conn, name = "data_game_log", value = data_game_log, row.names = FALSE, header = TRUE)
+```
+
+Ahora será necesario crear un ID para cada registro de *data_game_log*, esto es necesario dado que con identificar cada juego podremos hacer relaciones interesantes con otras tablas, posteriormente vamos a tratar de normalizar la base de datos.
+
+Retrosheet describe una forma para identificar cada juego, presione [aquí](https://www.retrosheet.org/eventfile.htm) para ver el sitio. Ellos proponen lo siguiente:
+
+_Cada juego comienza con un registro de identificación de doce caracteres que identifica la fecha, el equipo local y el número del juego. Por ejemplo, ATL198304080 debe leerse como sigue. Los primeros tres personajes identifican al equipo local (The Braves). Los siguientes cuatro son el año (1983). Los dos siguientes son el mes (abril) utilizando la notación numérica estándar, 04, seguida del día (08). El último dígito indica si se trata de un solo juego (0), primer juego (1) o segundo juego (2) si se juega más de un juego durante un día, generalmente un encabezado doble. El registro de identificación comienza la descripción de un juego así terminando la descripción del juego anterior en el archivo._
+
+Procedemos a crear una columna que servirá como ID a la tabla, este se llamará *game_id*
+```{r}
+alter_table <- "ALTER TABLE data_game_log ADD COLUMN game_id TEXT;"
+dbExecute(conn, alter_table)
+```
+
+Ahora llenamos con el formato que propone Retrosheet, concatenamos la fecha, el equipo de casa y el número de juego.
+```{r}
+dml_game_id <- "UPDATE data_game_log
+                SET game_id = date || h_name || number_of_game
+                WHERE game_id IS NULL;"
+dbExecute(conn, dml_game_id)
+```
+
+
+### Normalización
+En ocasiones en nuestra data podemos tener campos redundantes que en sí no ayudan y hacen ineficiente el almacenaje de información, ante esto existe la [normalización](https://docs.microsoft.com/es-es/office/troubleshoot/access/database-normalization-description) que nos ayuda a organizar las tablas y las relaciones.
+
+Veamos el contenido de la tabla *data_park*. Como usted puede ver está el ID de cada recinto, su nombre, la ciudad y estado a la que pertence, asimismo la fecha del primer y último juego, la liga y algunas notas.
+Note que la información referente a las fechas se puede obtener desde la tabla *data_game_log*, dado que ella contiene información de todos los juegos desde el siglo XIX, existe redundancia. Asimismo podemos categorizar las ligas de béisbol y agregar a que liga pertencen los equipos de manera rápida, no tiene sentido que el recinto tenga la columna _league_(Liga) dentro de sus registros. Si hacemos estos arreglos haremos más eficiente el almacenamiento y logrando normalización.
+
+```{r}
+head(data_park)
+```
+
+
+##### Proceso de normalización
+
+Vamos a iniciar con la tabla *data_park*, para ello crearemos una nueva tabla y posteriormente la vamos a llenar.
+
+```{r}
+q_park_table <- "
+  CREATE TABLE IF NOT EXISTS park(
+    park_id TEXT PRIMARY KEY,
+    name TEXT,
+    nickname TEXT,
+    city TEXT,
+    state TEXT,
+    notes TEXT
+  );
+"
+
+dbExecute(conn, q_park_table)
+
+
+q_insert_park <- "
+  INSERT OR IGNORE INTO park
+  SELECT
+      park_id,
+      name,
+      aka,
+      city,
+      state,
+      notes
+  FROM data_park;
+"
+
+dbExecute(conn, q_insert_park)
+
+q_check_park <- "SELECT * FROM park LIMIT 5;"
+run_query(q_check_park)
+```
+
+Hemos quitado las columnas que tratamos con anterioridad que no deberian de estar y llenamos con los datos que permiten una mejor gestión. Crearemos nuevas tablas siguiendo la misma idea.
+
+Vamos ahora con la tabla hecha para almacenar personas, veamos su contenido a continuación:
+```{r}
+head(data_person)
+```
+
+Siguiendo la lógica hecha en la tabla *park*, el debut de un jugador es un campo que se puede obtener de *data_game_log*. Asimismo como saber si debutó siendo entrenador o _umpire_(árbitro).
+
+
+```{r}
+q_person_table <- "
+  CREATE TABLE IF NOT EXISTS person(
+    person_id TEXT PRIMARY KEY,
+    first_name TEXT,
+    last_name TEXT
+  );
+"
+
+dbExecute(conn, q_person_table)
+
+q_insert_person <- "
+  INSERT OR IGNORE INTO person
+  SELECT
+      id,
+      first,
+      last
+  FROM data_person;
+"
+
+dbExecute(conn, q_insert_person)
+
+q_check_person <- "SELECT * FROM person LIMIT 5;"
+run_query(q_check_person)
+```
+
+Así como lo realizado anteriormente podemos seguir normalizando la base de datos, aquí algunas de las obervaciones:
+
+* En la tabla data_team, los campos _start, end_ (inicio, fin) pueden obtenerse de la tabla _data_game_log_.
+* Hay muchas columnas de la tabla *data_game_log_ que tienen datos repetidos sobre jugadores; tienen el ID del jugador seguido de su nombre, para esto dejaremos nada más las claves de las personas y estas irán relacionadas a la tabla _person_.
+* En _data_game_log_ todos los registros defensivos y ofensivos se repiten para los equipos de casa y visitante, para ellos podríamos hacer dos tablas, en una se listarian los juegos para los de casa y otra para los visitantes.
+* Asimismo en _data_game_log_ tenemos listados 9 jugadores en cada equipo y sus posiciones, podemos quitarlos y crear una tabla que siga las apariciones de los jugadores y las posiciones en la que lo hicieron.
+* De igual forma se puede hacer con los _umpires (árbitros)_, en lugar de tener las 4 posiciones como columnas en la tabla de _data_game_log_, podríamos tener a los _umpires_ en su propia tabla o tener una tabla distinta para jugadores, _umpires_ y _managers_.
+* Note que tambien en la tabla _data_game_log_ hay datos sobre "Pitcher ganador y perdedor". Podemos una tabla para cada uno, que contendría los premios o combinar los premios con las apariciones, así como con los jugadores y _umpires_.
+
+##### Tabla League
+
+```{r}
+q_league_table <- "
+  CREATE TABLE IF NOT EXISTS league (
+      league_id TEXT PRIMARY KEY,
+      name TEXT
+  );
+"
+dbExecute(conn, q_league_table)
+
+q_insert_league <- '
+  INSERT OR IGNORE INTO league
+  VALUES
+      ("NL", "National League"),
+      ("AL", "American League"),
+      ("AA", "American Association"),
+      ("FL", "Federal League"),
+      ("PL", "Players League"),
+      ("UA", "Union Association")
+  ;
+'
+dbExecute(conn, q_insert_league)
+
+q_check_league <- "SELECT * FROM league"
+run_query(q_check_league)
+```
+
+##### Tabla equipos
+
+Note que la tabla de equipos tiene una relación  con la tabla que contiene las ligas, ya podemos ir viendo como se irán relacionando estas tablas, eliminando la redundancia que teniamos al inicio.
+
+```{r}
+q_team_table <- "
+  CREATE TABLE IF NOT EXISTS team (
+      team_id TEXT PRIMARY KEY,
+      league_id TEXT,
+      city TEXT,
+      nickname TEXT,
+      franch_id TEXT,
+      FOREIGN KEY (league_id) REFERENCES league(league_id)
+  );
+"
+dbExecute(conn, q_team_table)
+
+q_insert_team <- "
+  INSERT OR IGNORE INTO team
+  SELECT
+      team_id,
+      league,
+      city,
+      nickname,
+      franch_id
+  FROM data_team;
+"
+dbExecute(conn, q_insert_team)
+
+q_check_team <- "SELECT * FROM team LIMIT 5;"
+run_query(q_check_team)
+```
+
+#### Tabla _games_
+Ahora vamos a crear una tabla para los juegos, esta contiene mucha menos columnas que _data_game_log_.
+
+```{r}
+q_games_table <- "
+  CREATE TABLE IF NOT EXISTS games (
+      game_id TEXT PRIMARY KEY,
+      date TEXT,
+      number_of_game INTEGER,
+      park_id TEXT,
+      length_outs INTEGER,
+      day BOOLEAN,
+      completion TEXT,
+      forefeit TEXT,
+      protest TEXT,
+      attendance INTEGER,
+      legnth_minutes INTEGER,
+      additional_info TEXT,
+      acquisition_info TEXT,
+      FOREIGN KEY (park_id) REFERENCES park(park_id)
+  );
+"
+dbExecute(conn, q_games_table)
+
+q_insert_games <- '
+  INSERT OR IGNORE INTO games
+  SELECT
+      game_id,
+      date,
+      number_of_game,
+      park_id,
+      length_outs,
+      CASE
+          WHEN day_night = "D" THEN 1
+          WHEN day_night = "N" THEN 0
+          ELSE NULL
+          END
+          AS day,
+      completion,
+      forefeit,
+      protest,
+      attendance,
+      length_minutes,
+      additional_info,
+      acquisition_info
+  FROM data_game_log;
+'
+dbExecute(conn, q_insert_games)
+
+q_check_games <- "SELECT * FROM games LIMIT 5;"
+run_query(q_check_games)
+```
+
+
+##### Apariciones de los equipos
+Procederemos a guardar las apariciones de los equipos.
+
+```{r}
+q_team_appearance_table <- "
+  CREATE TABLE IF NOT EXISTS team_appearance (
+      team_id TEXT,
+      game_id TEXT,
+      home BOOLEAN,
+      league_id TEXT,
+      score INTEGER,
+      line_score TEXT,
+      at_bats INTEGER,
+      hits INTEGER,
+      doubles INTEGER,
+      triples INTEGER,
+      homeruns INTEGER,
+      rbi INTEGER,
+      sacrifice_hits INTEGER,
+      sacrifice_flies INTEGER,
+      hit_by_pitch INTEGER,
+      walks INTEGER,
+      intentional_walks INTEGER,
+      strikeouts INTEGER,
+      stolen_bases INTEGER,
+      caught_stealing INTEGER,
+      grounded_into_double INTEGER,
+      first_catcher_interference INTEGER,
+      left_on_base INTEGER,
+      pitchers_used INTEGER,
+      individual_earned_runs INTEGER,
+      team_earned_runs INTEGER,
+      wild_pitches INTEGER,
+      balks INTEGER,
+      putouts INTEGER,
+      assists INTEGER,
+      errors INTEGER,
+      passed_balls INTEGER,
+      double_plays INTEGER,
+      triple_plays INTEGER,
+      PRIMARY KEY (team_id, game_id),
+      FOREIGN KEY (team_id) REFERENCES team(team_id),
+      FOREIGN KEY (game_id) REFERENCES games(game_id),
+      FOREIGN KEY (team_id) REFERENCES team(team_id)
+  );
+"
+dbExecute(conn, q_team_appearance_table)
+q_insert_team_appearance <- "
+  INSERT OR IGNORE INTO team_appearance
+      SELECT
+          h_name,
+          game_id,
+          1 AS home,
+          h_league,
+          h_score,
+          h_line_score,
+          h_at_bats,
+          h_hits,
+          h_doubles,
+          h_triples,
+          h_homeruns,
+          h_rbi,
+          h_sacrifice_hits,
+          h_sacrifice_flies,
+          h_hit_by_pitch,
+          h_walks,
+          h_intentional_walks,
+          h_strikeouts,
+          h_stolen_bases,
+          h_caught_stealing,
+          h_grounded_into_double,
+          h_first_catcher_interference,
+          h_left_on_base,
+          h_pitchers_used,
+          h_individual_earned_runs,
+          h_team_earned_runs,
+          h_wild_pitches,
+          h_balks,
+          h_putouts,
+          h_assists,
+          h_errors,
+          h_passed_balls,
+          h_double_plays,
+          h_triple_plays
+      FROM data_game_log
+  
+  UNION
+  
+      SELECT    
+          v_name,
+          game_id,
+          0 AS home,
+          v_league,
+          v_score,
+          v_line_score,
+          v_at_bats,
+          v_hits,
+          v_doubles,
+          v_triples,
+          v_homeruns,
+          v_rbi,
+          v_sacrifice_hits,
+          v_sacrifice_flies,
+          v_hit_by_pitch,
+          v_walks,
+          v_intentional_walks,
+          v_strikeouts,
+          v_stolen_bases,
+          v_caught_stealing,
+          v_grounded_into_double,
+          v_first_catcher_interference,
+          v_left_on_base,
+          v_pitchers_used,
+          v_individual_earned_runs,
+          v_team_earned_runs,
+          v_wild_pitches,
+          v_balks,
+          v_putouts,
+          v_assists,
+          v_errors,
+          v_passed_balls,
+          v_double_plays,
+          v_triple_plays
+      from data_game_log;
+"
+dbExecute(conn, q_insert_team_appearance)
+
+q_check_team_appearance <- "
+  SELECT * FROM team_appearance
+  WHERE game_id = (
+                   SELECT MIN(game_id) from games
+                  )
+     OR game_id = (
+                   SELECT MAX(game_id) from games
+                  )
+  ORDER By game_id, home;
+"
+
+run_query(q_check_team_appearance)
+```
+
+Puede ver que hemos dividido la tabla _data_game_log_ en otras tablas que obtienen algunos de sus campos y las podemos relacionar con las que hemos ido creando, de esta forma va tomando forma nuestra base de datos y podrá ser usada para hacr consultas más simples.
+
+
+
+# Aparición de las personas
+
+```{r}
+
+q_person_appearance_table <- "
+  CREATE TABLE IF NOT EXISTS person_appearance (
+      appearance_id INTEGER PRIMARY KEY,
+      person_id TEXT,
+      team_id TEXT,
+      game_id TEXT,
+      appearance_type_id,
+      FOREIGN KEY (person_id) REFERENCES person(person_id),
+      FOREIGN KEY (team_id) REFERENCES team(team_id),
+      FOREIGN KEY (game_id) REFERENCES games(game_id),
+      FOREIGN KEY (appearance_type_id) REFERENCES appearance_type(appearance_type_id)
+  );
+"
+dbExecute(conn, q_person_appearance_table)
+
+q_insert_person_appearance <- '
+  INSERT OR IGNORE INTO person_appearance (
+      game_id,
+      team_id,
+      person_id,
+      appearance_type_id
+  ) 
+      SELECT
+          game_id,
+          NULL,
+          hp_umpire_id,
+          "UHP"
+      FROM data_game_log
+      WHERE hp_umpire_id IS NOT NULL    
+  
+  UNION
+  
+      SELECT
+          game_id,
+          NULL,
+          [1b_umpire_id],
+          "U1B"
+      FROM data_game_log
+      WHERE "1b_umpire_id" IS NOT NULL
+  
+  UNION
+  
+      SELECT
+          game_id,
+          NULL,
+          [2b_umpire_id],
+          "U2B"
+      FROM data_game_log
+      WHERE [2b_umpire_id] IS NOT NULL
+  
+  UNION
+  
+      SELECT
+          game_id,
+          NULL,
+          [3b_umpire_id],
+          "U3B"
+      FROM data_game_log
+      WHERE [3b_umpire_id] IS NOT NULL
+  
+  UNION
+  
+      SELECT
+          game_id,
+          NULL,
+          lf_umpire_id,
+          "ULF"
+      FROM data_game_log
+      WHERE lf_umpire_id IS NOT NULL
+  
+  UNION
+  
+      SELECT
+          game_id,
+          NULL,
+          rf_umpire_id,
+          "URF"
+      FROM data_game_log
+      WHERE rf_umpire_id IS NOT NULL
+  
+  UNION
+  
+      SELECT
+          game_id,
+          v_name,
+          v_manager_id,
+          "MM"
+      FROM data_game_log
+      WHERE v_manager_id IS NOT NULL
+  
+  UNION
+  
+      SELECT
+          game_id,
+          h_name,
+          h_manager_id,
+          "MM"
+      FROM data_game_log
+      WHERE h_manager_id IS NOT NULL
+  
+  UNION
+  
+      SELECT
+          game_id,
+          CASE
+              WHEN h_score > v_score THEN h_name
+              ELSE v_name
+              END,
+          winning_pitcher_id,
+          "AWP"
+      FROM data_game_log
+      WHERE winning_pitcher_id IS NOT NULL
+  
+  UNION
+  
+      SELECT
+          game_id,
+          CASE
+              WHEN h_score < v_score THEN h_name
+              ELSE v_name
+              END,
+          losing_pitcher_id,
+          "ALP"
+      FROM data_game_log
+      WHERE losing_pitcher_id IS NOT NULL
+  
+  UNION
+  
+      SELECT
+          game_id,
+          CASE
+              WHEN h_score > v_score THEN h_name
+              ELSE v_name
+              END,
+          saving_pitcher_id,
+          "ASP"
+      FROM data_game_log
+      WHERE saving_pitcher_id IS NOT NULL
+  
+  UNION
+  
+      SELECT
+          game_id,
+          CASE
+              WHEN h_score > v_score THEN h_name
+              ELSE v_name
+              END,
+          winning_rbi_batter_id,
+          "AWB"
+      FROM data_game_log
+      WHERE winning_rbi_batter_id IS NOT NULL
+  
+  UNION
+  
+      SELECT
+          game_id,
+          v_name,
+          v_starting_pitcher_id,
+          "PSP"
+      FROM data_game_log
+      WHERE v_starting_pitcher_id IS NOT NULL
+  
+  UNION
+  
+      SELECT
+          game_id,
+          h_name,
+          h_starting_pitcher_id,
+          "PSP"
+      FROM data_game_log
+      WHERE h_starting_pitcher_id IS NOT NULL;
+'
+dbExecute(conn, q_insert_person_appearance)
+```
+
+
+# Remviendo las tablas originales
+
+```{r}
+# Check the current status of the db file
+dbListTables(conn)
+# Iterate through each of the tables
+tables <- c("data_game_log", "data_park",
+            "data_team", "data_person")
+for (t in tables) {
+  drop_command = sprintf("DROP TABLE %s", t)
+  dbExecute(conn, drop_command)
+}
+# Make sure that everything is gone
+dbListTables(conn)
+```
+
+
+
+
+
+```{r}
+dbDisconnect(conn)
+```
+

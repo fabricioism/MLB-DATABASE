@@ -1,0 +1,5 @@
+library(dplyr)
+data_park_codes <- read.csv("park_codes.csv")
+data_person_codes <- read.csv("person_codes.csv")
+data_team_codes <- read.csv("team_codes.csv")
+data_game_log <- read.csv("game_log.csv")
