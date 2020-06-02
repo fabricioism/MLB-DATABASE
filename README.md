@@ -1,0 +1,2 @@
+# MLB-DATABASE
+Se modela y crea una base de datos que guarde información de todos los juegos de Béisbol desde el siglo XIX hasta nuestros días. En este trabajo se hará uso del lenguaje R y SQL para lograrlo, asimismo normalizaremos la base de datos que contendrá información provista por Retrosheet. Este proyecto es ideado por Dataquest Labs como una forma de desarrollar habilidades en SQL para Data Analysis, tomé este proyecto dado que soy estudiante en la especialización.
